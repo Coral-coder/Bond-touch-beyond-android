@@ -37,6 +37,12 @@ upload key and an Apple developer account. All of it goes into this repo's
 
 ### Firebase (how partners reach each other)
 
+**Quick way:** `scripts/setup_firebase.sh --new <project-id>` creates the project, the database,
+the rules and the apps, and stores the config as GitHub secrets. Use `--project <id>` to reuse
+an existing project instead (read the notes it prints). It's all on the free Spark plan.
+
+By hand:
+
 1. Create a Firebase project.
 2. Add an **Android app** with package `com.lightwave.beyond`, and download
    `google-services.json`. Add an **iOS app** with your iOS bundle ID (default

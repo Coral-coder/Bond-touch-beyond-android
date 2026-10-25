@@ -53,3 +53,4 @@ firebase.env.json
 ios/Runner/GoogleService-Info.plist
 *.p8
 *.jks
+firebase-config/
