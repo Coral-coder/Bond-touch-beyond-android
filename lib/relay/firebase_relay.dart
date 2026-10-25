@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
 
@@ -118,6 +119,7 @@ class FirebaseRelay {
       }),
       code,
     );
+    await _announce('pf', bond);
     return bond;
   }
 
@@ -150,6 +152,7 @@ class FirebaseRelay {
       }),
       code,
     );
+    await _announce('pf', bond);
     return bond;
   }
 
@@ -186,17 +189,21 @@ class FirebaseRelay {
   Future<int> sendChat(Bond bond, Map<String, Object?> message) =>
       _sendEvent(bond, 'Message', (seq) => {...message, 'seq': seq});
 
-  Future<void> sendHeartbeat(Bond bond, int bpm) async => _put(
-    await _mine(bond, 'hb'),
-    {'bpm': bpm, 'sentAt': SwiftJson.date(DateTime.now())},
-    bond.code,
-  );
+  Future<void> sendHeartbeat(Bond bond, int bpm) async {
+    await _put(await _mine(bond, 'hb'), {
+      'bpm': bpm,
+      'sentAt': SwiftJson.date(DateTime.now()),
+    }, bond.code);
+    await _announce('hb', bond);
+  }
 
-  Future<void> sendPresence(Bond bond, Map<String, Object?> presence) async =>
-      _put(await _mine(bond, 'pr'), {
-        ...presence,
-        'sentAt': SwiftJson.date(DateTime.now()),
-      }, bond.code);
+  Future<void> sendPresence(Bond bond, Map<String, Object?> presence) async {
+    await _put(await _mine(bond, 'pr'), {
+      ...presence,
+      'sentAt': SwiftJson.date(DateTime.now()),
+    }, bond.code);
+    await _announce('pr', bond);
+  }
 
   final _writtenPhotoHash = <String, String>{};
 
@@ -234,12 +241,50 @@ class FirebaseRelay {
       }),
       bond.code,
     );
+    await _announce('pf', bond);
   }
 
-  Future<void> sendSpace(Bond bond, Map<String, Object?> space) async =>
-      _put(await _mine(bond, 'sx'), space, bond.code);
-  Future<void> sendBoard(Bond bond, Map<String, Object?> board) async =>
-      _put(await _mine(bond, 'wb'), board, bond.code);
+  Future<void> sendSpace(Bond bond, Map<String, Object?> space) async {
+    await _put(await _mine(bond, 'sx'), space, bond.code);
+    await _announce('sx', bond);
+  }
+
+  Future<void> sendBoard(Bond bond, Map<String, Object?> board) async {
+    await _put(await _mine(bond, 'wb'), board, bond.code);
+    await _announce('wb', bond);
+  }
+
+  // MARK: Change counters
+
+  /// Firestore's free plan allows 50 000 reads a day, so the partner polls only the cursor:
+  /// it carries a counter per record (`rev`), bumped on every write, and the partner fetches a
+  /// record only when its counter moved. Same scheme as the iPhone app.
+  String _revKey(String code) => 'relay.rev.$code';
+
+  Future<Map<String, int>> _revs(String code) async {
+    final raw = (await SharedPreferences.getInstance()).getString(
+      _revKey(code),
+    );
+    if (raw == null) return {};
+    return (jsonDecode(raw) as Map<String, dynamic>).map(
+      (k, v) => MapEntry(k, (v as num).toInt()),
+    );
+  }
+
+  /// After writing record `what`: bumps its counter and rewrites the cursor.
+  Future<void> _announce(String what, Bond bond) async {
+    final r = await _revs(bond.code);
+    r[what] = (r[what] ?? 0) + 1;
+    await (await SharedPreferences.getInstance()).setString(
+      _revKey(bond.code),
+      jsonEncode(r),
+    );
+    await _loadCounters(bond);
+    await _writeCursor(bond);
+  }
+
+  /// The partner's record counters already fetched (by record name), this launch.
+  final _seenRevs = <String, int>{};
 
   // MARK: Rings
 
@@ -279,6 +324,7 @@ class FirebaseRelay {
       'message': p.getInt(_seqKey(bond.code, 'Message')) ?? 0,
       'seenTouch': p.getInt(_seenKey(bond.code, 'Touch')) ?? 0,
       'seenMessage': p.getInt(_seenKey(bond.code, 'Message')) ?? 0,
+      'rev': await _revs(bond.code),
     }, bond.code);
   }
 
@@ -332,7 +378,30 @@ class FirebaseRelay {
     final pf = await _theirs(bond, 'pf'),
         sx = await _theirs(bond, 'sx'),
         wb = await _theirs(bond, 'wb');
-    final found = await _get([cur, hb, pr, pf, sx, wb]);
+    // The cursor alone, then only the records whose counters moved. Without counters (no
+    // cursor yet) read everything; with them, a record with no counter hasn't been written.
+    final found = await _get([cur]);
+    final rev = (await _open(found[cur], code))?['rev'] as Map?;
+    final changed = [
+      for (final e in {
+        'hb': hb,
+        'pr': pr,
+        'pf': pf,
+        'sx': sx,
+        'wb': wb,
+      }.entries)
+        if (rev == null ||
+            (rev[e.key] != null &&
+                _seenRevs[e.value] != (rev[e.key] as num).toInt()))
+          e,
+    ];
+    if (changed.isNotEmpty) {
+      found.addAll(await _get([for (final e in changed) e.value]));
+      for (final e in changed) {
+        final n = rev?[e.key] as num?;
+        if (n != null) _seenRevs[e.value] = n.toInt();
+      }
+    }
 
     if (found[sx] != null && _isNew(found[sx]!)) {
       ev.space = await _open(found[sx], code);
@@ -435,14 +504,11 @@ class FirebaseRelay {
 
   final _seenPhotoHash = <String, String>{};
 
-  /// Fires when the partner's cursor or presence changes (live while the app runs).
+  /// Fires when the partner's cursor changes, i.e. anything of theirs (live while the app runs).
   Stream<void> watch(Bond bond) async* {
     await signIn();
-    final names = [
-      await _theirs(bond, 'cur'),
-      await _theirs(bond, 'pr'),
-      await _theirs(bond, 'pf'),
-    ];
+    // The cursor announces every change (see `_announce`), so one listener is enough.
+    final names = [await _theirs(bond, 'cur')];
     final controller = StreamController<void>();
     final subs = [
       for (final n in names)

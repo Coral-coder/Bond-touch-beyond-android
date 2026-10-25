@@ -129,8 +129,10 @@ class AppModel extends ChangeNotifier {
 
   void _startPolling() {
     _poll?.cancel();
+    // Partners' changes arrive live through the cursor listener (`_watch`); polling is only
+    // a fallback, kept slow for Firestore's free daily read allowance.
     _poll = Timer.periodic(
-      Duration(seconds: inForeground ? 4 : 20),
+      Duration(seconds: inForeground ? 30 : 60),
       (_) => refreshAll(),
     );
   }
