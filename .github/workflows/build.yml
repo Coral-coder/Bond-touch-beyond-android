@@ -11,20 +11,26 @@
 #   ANDROID_KEY_ALIAS           its key alias (default "upload")
 #   ANDROID_KEY_PASSWORD        the key's password (default: the keystore password)
 #   APPLE_TEAM_ID               Apple developer team ID          ┐ all four: signed iOS build,
-#   ASC_KEY_ID                  App Store Connect API key ID     │ uploaded to TestFlight from
+#   ASC_KEY_ID                  App Store Connect API key ID     │ uploaded to TestFlight only
 #   ASC_ISSUER_ID               its issuer ID                    │ main
 #   ASC_KEY_P8                  the key (.p8 contents)           ┘
 # Variables
 #   IOS_BUNDLE_ID               iOS bundle ID (default com.lightwave.bondTouchBeyond)
 #
 # Outputs: the Android APK + AAB and the iOS build as run artifacts; on main, a GitHub
-# Release with the APK (…/releases/latest/download/BondTouchBeyond.apk), and TestFlight.
+# Release with the APK (…/releases/latest/download/BondTouchBeyond.apk). TestFlight uploads
+# happen only from a manual run with "Upload to TestFlight" ticked.
 name: Build
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      testflight:
+        description: Upload the iOS build to TestFlight
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -202,7 +208,8 @@ jobs:
             DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic archive > build/xcodebuild.log 2>&1 \
             || { grep -E ': error: ' build/xcodebuild.log | sort -u | head -30; tail -80 build/xcodebuild.log; exit 1; }
           upload=false
-          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then upload=true; fi
+          # TestFlight only when asked: Actions → Build → Run workflow → "Upload to TestFlight".
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "${{ inputs.testflight }}" = true ]; then upload=true; fi
           dest=$([ "$upload" = true ] && echo upload || echo export)
           cat > build/ExportOptions.plist <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>

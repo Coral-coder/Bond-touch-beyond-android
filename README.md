@@ -77,7 +77,8 @@ with a throwaway debug key.
 3. Create the app in App Store Connect with your bundle ID. If it isn't
    `com.lightwave.bondTouchBeyond`, set the repository variable `IOS_BUNDLE_ID`.
 
-Builds from `main` then go to TestFlight. Xcode signing sets up the certificate, the
+Uploads to TestFlight happen only when you ask: Actions → Build → Run workflow → tick
+"Upload to TestFlight". Xcode signing sets up the certificate, the
 profile, and the HealthKit and Push capabilities automatically. Without these secrets, the
 iOS build is unsigned and only checks that the app compiles.
 
@@ -89,7 +90,8 @@ CI (`.github/workflows/build.yml`) runs on every push:
 2. Android: APK + App Bundle.
 3. iOS: signed build, or unsigned without the Apple secrets.
 
-On `main` it also publishes a GitHub Release with the APK and uploads iOS to TestFlight.
+On `main` it also publishes a GitHub Release with the APK. It never uploads to TestFlight
+unless you run it by hand with that box ticked.
 Public repositories get these runners free.
 
 Locally:
