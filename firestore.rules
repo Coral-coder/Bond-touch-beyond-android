@@ -1,0 +1,29 @@
+rules_version = '2';
+// Records are opaque: `<locator>-<suffix>` names derived from a bond's secret code, holding
+// only AES-GCM ciphertext (`p`). Anyone signed in (anonymously) may read a record whose exact
+// name they know — that's how the two partners find each other's — but nobody may list or
+// query the collection, so records can't be enumerated. Only the writer (`o`) may change or
+// delete a record.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /r/{record} {
+      allow get: if request.auth != null;
+      allow list: if false;
+      allow create: if request.auth != null
+        && request.resource.data.o == request.auth.uid
+        && request.resource.data.keys().hasOnly(['p', 'o', 't'])
+        && request.resource.data.p is bytes
+        && request.resource.data.p.size() < 900 * 1024;
+      allow update: if request.auth != null
+        && resource.data.o == request.auth.uid
+        && request.resource.data.o == request.auth.uid
+        && request.resource.data.keys().hasOnly(['p', 'o', 't'])
+        && request.resource.data.p is bytes
+        && request.resource.data.p.size() < 900 * 1024;
+      allow delete: if request.auth != null && resource.data.o == request.auth.uid;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,233 @@
+# Builds Bond Touch Beyond for Android and iOS on every push and pull request. Everything it
+# needs comes from this repository's own secrets and variables (Settings → Secrets and
+# variables → Actions); nothing outside the repo. Every secret is optional: without them the
+# apps still build (unsigned / debug-signed, no Firebase), so a fork builds out of the box.
+#
+# Secrets
+#   GOOGLE_SERVICES_JSON        Firebase Android config (google-services.json), raw or base64
+#   GOOGLE_SERVICE_INFO_PLIST   Firebase iOS config (GoogleService-Info.plist), raw or base64
+#   ANDROID_KEYSTORE_BASE64     Android upload key (PKCS12 keystore), base64
+#   ANDROID_KEYSTORE_PASSWORD   its password
+#   ANDROID_KEY_ALIAS           its key alias (default "upload")
+#   ANDROID_KEY_PASSWORD        the key's password (default: the keystore password)
+#   APPLE_TEAM_ID               Apple developer team ID          ┐ all four: signed iOS build,
+#   ASC_KEY_ID                  App Store Connect API key ID     │ uploaded to TestFlight from
+#   ASC_ISSUER_ID               its issuer ID                    │ main
+#   ASC_KEY_P8                  the key (.p8 contents)           ┘
+# Variables
+#   IOS_BUNDLE_ID               iOS bundle ID (default com.lightwave.bondTouchBeyond)
+#
+# Outputs: the Android APK + AAB and the iOS build as run artifacts; on main, a GitHub
+# Release with the APK (…/releases/latest/download/BondTouchBeyond.apk), and TestFlight.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.7
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze --no-fatal-infos
+      - run: flutter test
+
+  android:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+
+      - name: Firebase config
+        env:
+          CONFIG: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$CONFIG" ]; then
+            echo "::warning::No GOOGLE_SERVICES_JSON secret: the app builds, but can't reach partners."
+            echo '{}' > firebase.env.json; exit 0
+          fi
+          if printf '%s' "$CONFIG" | grep -q '"project_info"'; then printf '%s' "$CONFIG" > "$RUNNER_TEMP/gs.json"
+          else printf '%s' "$CONFIG" | base64 -d > "$RUNNER_TEMP/gs.json"; fi
+          python3 scripts/firebase_defines.py --android "$RUNNER_TEMP/gs.json" > firebase.env.json
+          rm -f "$RUNNER_TEMP/gs.json"
+
+      - name: Signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/upload-keystore.p12
+          else
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: signing with a debug key."
+          fi
+
+      - name: Build APK and App Bundle
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          args="--release --build-number $GITHUB_RUN_NUMBER --dart-define-from-file=firebase.env.json"
+          flutter build apk $args
+          flutter build appbundle $args
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk dist/BondTouchBeyond.apk
+          cp build/app/outputs/bundle/release/app-release.aab dist/BondTouchBeyond.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ github.run_number }}
+          path: dist/
+
+      - name: Release
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -nE 's/^version: ([0-9.]+)\+.*/\1/p' pubspec.yaml)
+          gh release create "build-$GITHUB_RUN_NUMBER" dist/BondTouchBeyond.apk dist/BondTouchBeyond.aab \
+            --title "Bond Touch Beyond $VERSION ($GITHUB_RUN_NUMBER)" \
+            --notes "Build $GITHUB_RUN_NUMBER from ${GITHUB_SHA::7}. On Android, install BondTouchBeyond.apk." --latest
+
+      - name: Clean up
+        if: always()
+        run: rm -f android/upload-keystore.p12 firebase.env.json
+
+  ios:
+    needs: check
+    # App Store Connect only takes builds from Xcode 26 or later.
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.lightwave.bondTouchBeyond' }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Select Xcode 26 or later
+        run: |
+          xcode=$(ls -d /Applications/Xcode_2[6-9]*.app /Applications/Xcode_[3-9][0-9]*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
+          xcodebuild -version
+
+      - run: flutter pub get
+
+      - name: Bundle ID
+        run: |
+          if [ "$BUNDLE_ID" != com.lightwave.bondTouchBeyond ]; then
+            sed -i '' "s/com\.lightwave\.bondTouchBeyond/$BUNDLE_ID/g" ios/Runner.xcodeproj/project.pbxproj
+          fi
+          echo "Bundle ID $BUNDLE_ID"
+
+      - name: Firebase config
+        env:
+          CONFIG: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+        run: |
+          if [ -z "$CONFIG" ]; then
+            echo "::warning::No GOOGLE_SERVICE_INFO_PLIST secret: the app builds, but can't reach partners."
+            echo '{}' > firebase.env.json; exit 0
+          fi
+          if printf '%s' "$CONFIG" | grep -q '<plist'; then printf '%s' "$CONFIG" > "$RUNNER_TEMP/gs.plist"
+          else printf '%s' "$CONFIG" | base64 -D > "$RUNNER_TEMP/gs.plist"; fi
+          python3 scripts/firebase_defines.py --ios "$RUNNER_TEMP/gs.plist" > firebase.env.json
+          rm -f "$RUNNER_TEMP/gs.plist"
+
+      - name: Signing
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          if [ -z "$TEAM_ID" ] || [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ] || [ -z "$ASC_KEY_P8" ]; then
+            echo "::warning::No Apple signing secrets: building unsigned (not installable, checks it compiles)."
+            echo "SIGNED=false" >> "$GITHUB_ENV"; exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" >> "$GITHUB_ENV"
+          echo "SIGNED=true" >> "$GITHUB_ENV"
+
+      - name: Build (unsigned)
+        if: env.SIGNED != 'true'
+        run: |
+          flutter build ios --release --no-codesign --build-number "$GITHUB_RUN_NUMBER" \
+            --dart-define-from-file=firebase.env.json
+          mkdir -p dist && (cd build/ios/iphoneos && zip -qr "$GITHUB_WORKSPACE/dist/BondTouchBeyond-unsigned.zip" Runner.app)
+
+      # Flutter writes its settings (version, defines) into the Xcode project; xcodebuild then
+      # archives with automatic signing through the App Store Connect key, creating the
+      # certificate and profile as needed.
+      - name: Archive (signed)
+        if: env.SIGNED == 'true'
+        run: |
+          flutter build ios --release --config-only --build-number "$GITHUB_RUN_NUMBER" \
+            --dart-define-from-file=firebase.env.json
+          auth=(-allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH"
+                -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath build/Runner.xcarchive "${auth[@]}" \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic archive > build/xcodebuild.log 2>&1 \
+            || { grep -E ': error: ' build/xcodebuild.log | sort -u | head -30; tail -80 build/xcodebuild.log; exit 1; }
+          upload=false
+          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then upload=true; fi
+          dest=$([ "$upload" = true ] && echo upload || echo export)
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>$dest</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/Runner.xcarchive \
+            -exportOptionsPlist build/ExportOptions.plist -exportPath build/ipa "${auth[@]}"
+          mkdir -p dist && cp build/ipa/*.ipa dist/ 2>/dev/null || true
+          if [ "$upload" = true ]; then
+            echo "### TestFlight: uploaded build $GITHUB_RUN_NUMBER ($BUNDLE_ID)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: ignore
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc" firebase.env.json
