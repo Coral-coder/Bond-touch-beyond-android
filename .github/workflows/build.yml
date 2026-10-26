@@ -2,10 +2,9 @@
 # in its own repository; this Flutter project is built for Android only.) Everything it
 # needs comes from this repository's own secrets and variables (Settings → Secrets and
 # variables → Actions); nothing outside the repo. Every secret is optional: without them the
-# apps still build (debug-signed, no Firebase), so a fork builds out of the box.
+# apps still build (debug-signed), so a fork builds out of the box.
 #
 # Secrets
-#   GOOGLE_SERVICES_JSON        Firebase Android config (google-services.json), raw or base64
 #   ANDROID_KEYSTORE_BASE64     Android upload key (PKCS12 keystore), base64
 #   ANDROID_KEYSTORE_PASSWORD   its password
 #   ANDROID_KEY_ALIAS           its key alias (default "upload")
@@ -60,19 +59,6 @@ jobs:
           cache: true
       - run: flutter pub get
 
-      - name: Firebase config
-        env:
-          CONFIG: ${{ secrets.GOOGLE_SERVICES_JSON }}
-        run: |
-          if [ -z "$CONFIG" ]; then
-            echo "::warning::No GOOGLE_SERVICES_JSON secret: the app builds, but can't reach partners."
-            echo '{}' > firebase.env.json; exit 0
-          fi
-          if printf '%s' "$CONFIG" | grep -q '"project_info"'; then printf '%s' "$CONFIG" > "$RUNNER_TEMP/gs.json"
-          else printf '%s' "$CONFIG" | base64 -d > "$RUNNER_TEMP/gs.json"; fi
-          python3 scripts/firebase_defines.py --android "$RUNNER_TEMP/gs.json" > firebase.env.json
-          rm -f "$RUNNER_TEMP/gs.json"
-
       - name: Signing key
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -89,7 +75,7 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          args="--release --build-number $GITHUB_RUN_NUMBER --dart-define-from-file=firebase.env.json"
+          args="--release --build-number $GITHUB_RUN_NUMBER"
           flutter build apk $args
           flutter build appbundle $args
           mkdir -p dist
@@ -113,4 +99,4 @@ jobs:
 
       - name: Clean up
         if: always()
-        run: rm -f android/upload-keystore.p12 firebase.env.json
+        run: rm -f android/upload-keystore.p12

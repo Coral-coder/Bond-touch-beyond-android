@@ -6,7 +6,7 @@ import 'charts.dart';
 import 'theme.dart';
 
 /// Your personal battery and how you're feeling, from Health Connect and what you log, with
-/// your charts and every partner's last reading.
+/// your charts. (The Bond Touch servers don't carry mood, so it stays on this phone.)
 class StressMoodPage extends StatelessWidget {
   const StressMoodPage({super.key, required this.model});
   final AppModel model;
@@ -36,7 +36,6 @@ class StressMoodPage extends StatelessWidget {
       return RefreshIndicator(
         onRefresh: () async {
           await h.refresh();
-          await model.publishPresence(force: true);
         },
         child: ListView(
           padding: const EdgeInsets.all(16),
@@ -93,7 +92,7 @@ class StressMoodPage extends StatelessWidget {
                       onPressed: () async {
                         await h.requestAccess();
                         await h.refresh();
-                        await model.publishPresence(force: true);
+                        model.healthChanged();
                       },
                       child: const Text('Allow Health Connect'),
                     ),
@@ -139,59 +138,11 @@ class StressMoodPage extends StatelessWidget {
                 ],
               ),
             ),
-            const SizedBox(height: 14),
-            Glass(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Your people',
-                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
-                  ),
-                  for (final p in model.partners) _partnerRow(context, p),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            SwitchListTile(
-              value: model.shareMood,
-              onChanged: model.setMoodSharing,
-              title: const Text('Share with my partners'),
-              subtitle: const Text(
-                'Your battery, mood, HRV and heart rate. Notes stay on this phone.',
-              ),
-            ),
           ],
         ),
       );
     },
   );
-
-  Widget _partnerRow(BuildContext context, Partner p) {
-    final mood = p.presence?.mood;
-    final lastHRV = mood?.series.lastOrNull;
-    final lastHR = mood?.heartRate.lastOrNull;
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: Avatar(
-        name: p.name,
-        color: p.colorRGB,
-        photo: p.photo,
-        size: 40,
-        online: p.online,
-      ),
-      title: Text(p.name, style: const TextStyle(fontWeight: FontWeight.w800)),
-      subtitle: Text(
-        mood == null
-            ? 'No mood reported yet'
-            : '${mood.emoji} ${mood.label} · ${whenText(context, mood.at)}'
-                  '${lastHRV != null ? '\nHRV ${lastHRV.hrv.round()} ms · ${whenText(context, lastHRV.at)}' : ''}'
-                  '${lastHR != null ? '\nHeart rate ${lastHR.bpm.round()} bpm · ${whenText(context, lastHR.at)}' : ''}',
-        style: const TextStyle(color: AppTheme.subtitle),
-      ),
-      isThreeLine: lastHRV != null || lastHR != null,
-    );
-  }
 
   Widget _stat(String title, String value, String sub) => Expanded(
     child: Column(
