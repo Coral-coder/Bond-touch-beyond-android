@@ -39,8 +39,15 @@ use. Partners on the official app, on the iPhone app, or on this one all reach e
     flutter test
     flutter build apk --release
 
-CI (`.github/workflows/build.yml`) does the same on every push. On `main` it also publishes a
-GitHub Release with the APK (`…/releases/latest/download/BondTouchBeyond.apk`).
+CI (`.github/workflows/build.yml`) does the same on every push. Every push to `main` is also
+published as a GitHub Release with the APK and an `update.json`:
+
+- Newest build: https://github.com/Coral-coder/Bond-touch-beyond-android/releases/latest/download/BondTouchBeyond.apk
+- Installed copies check `releases/latest/download/update.json` on launch and whenever they come
+  back to the foreground (at most hourly). When there's a newer build they download it and offer
+  to install it (`lib/app/updater.dart`). Settings → App version → Check for updates does the same
+  on demand. Android installs an update over the old build only when both are signed with the
+  same key, so releases are signed with the shared upload key below.
 
 ### Android signing (Play Store / updates)
 
@@ -48,6 +55,8 @@ GitHub Release with the APK (`…/releases/latest/download/BondTouchBeyond.apk`)
       -alias upload -keyalg RSA -keysize 2048 -validity 10000
     base64 -w0 upload-keystore.p12     # → ANDROID_KEYSTORE_BASE64
 
-Add `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD` and `ANDROID_KEY_ALIAS` (`upload`) as
-repository secrets. Keep the keystore safe: every future update must be signed with it.
+The key is the upload key shared with the other apps. Dev_deploy_setup's **Set up app repo**
+copies `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and
+`ANDROID_KEY_PASSWORD` here. To use your own key instead, generate one as above and add those
+secrets yourself. Keep the keystore safe: every future update must be signed with it.
 Without it, builds are signed with a throwaway debug key.

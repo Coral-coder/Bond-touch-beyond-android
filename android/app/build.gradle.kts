@@ -30,24 +30,25 @@ android {
         versionName = flutter.versionName
     }
 
-    // Release signing from the upload key CI decodes into android/upload-keystore.p12
-    // (ANDROID_KEYSTORE_BASE64 & co.); without it, release builds use the debug key.
-    val keystore = rootProject.file("upload-keystore.p12")
+    // Release signing from the environment: CI decodes the ANDROID_KEYSTORE_* secrets (the
+    // same upload key as the other apps) and points ANDROID_KEYSTORE_PATH at it. Without it,
+    // release builds use the debug key.
+    val storePath = System.getenv("ANDROID_KEYSTORE_PATH")
+    val hasStore = storePath != null && file(storePath).exists()
     signingConfigs {
-        if (keystore.exists()) {
-            create("upload") {
-                storeFile = keystore
-                storeType = "PKCS12"
+        if (hasStore) {
+            create("release") {
+                storeFile = file(storePath!!)
                 storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "upload"
-                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
             }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = if (keystore.exists()) signingConfigs.getByName("upload") else signingConfigs.getByName("debug")
+            signingConfig = if (hasStore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
     }
 }

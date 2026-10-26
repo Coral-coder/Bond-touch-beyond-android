@@ -6,6 +6,7 @@ import 'app/app_model.dart';
 import 'ui/home.dart';
 import 'ui/onboarding.dart';
 import 'ui/theme.dart';
+import 'ui/update.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -46,11 +47,14 @@ class _BondAppState extends State<BondApp> {
     debugShowCheckedModeBanner: false,
     theme: AppTheme.data,
     scaffoldMessengerKey: _messenger,
-    home: ListenableBuilder(
-      listenable: widget.model,
-      builder: (context, _) => widget.model.profileComplete
-          ? HomeShell(model: widget.model)
-          : Onboarding(model: widget.model),
+    // Checks GitHub Releases for a newer build on launch and on every return to the app.
+    home: UpdateCheck(
+      child: ListenableBuilder(
+        listenable: widget.model,
+        builder: (context, _) => widget.model.profileComplete
+            ? HomeShell(model: widget.model)
+            : Onboarding(model: widget.model),
+      ),
     ),
   );
 }
