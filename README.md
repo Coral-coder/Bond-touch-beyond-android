@@ -1,6 +1,7 @@
-# Bond Touch Beyond — Android & iOS
+# Bond Touch Beyond — Android
 
-Bond Touch Beyond in Flutter, one codebase for Android and iPhone: your Bond Touch bracelet over Bluetooth,
+The Android app for Bond Touch Beyond, in Flutter (the iPhone app is the native one in its own
+repository): your Bond Touch bracelet over Bluetooth,
 touches and chat with your partners, live status and location, and stress, HRV and heart rate
 from Health Connect. Partners can be on Android or iPhone.
 
@@ -31,7 +32,7 @@ app's iCloud relay:
 
 Nothing in this repository depends on any particular company's servers or accounts. Whoever
 builds it brings a Firebase project (free Spark plan is enough), and optionally a Google Play
-upload key and an Apple developer account. All of it goes into this repo's
+upload key. All of it goes into this repo's
 **Settings → Secrets and variables → Actions**; the full list is at the top of
 `.github/workflows/build.yml`. Every secret is optional, so the project builds without them.
 
@@ -45,13 +46,14 @@ By hand:
 
 1. Create a Firebase project.
 2. Add an **Android app** with package `com.lightwave.beyond`, and download
-   `google-services.json`. Add an **iOS app** with your iOS bundle ID (default
-   `com.lightwave.bondTouchBeyond`), and download `GoogleService-Info.plist`.
+   `google-services.json`. Add an **iOS app** `com.lightwave.beyond` for the iPhone app, and
+   download `GoogleService-Info.plist`.
 3. Turn on **Authentication → Sign-in method → Anonymous** and create a **Firestore**
    database.
 4. Publish the rules in `firestore.rules`: paste them into Firestore → Rules, or run
    `firebase deploy --only firestore:rules`.
-5. Add the two files as the secrets `GOOGLE_SERVICES_JSON` and `GOOGLE_SERVICE_INFO_PLIST`.
+5. Add `google-services.json` here as the secret `GOOGLE_SERVICES_JSON`, and
+   `GoogleService-Info.plist` to the iPhone app's repository as `GOOGLE_SERVICE_INFO_PLIST`.
    Paste the whole file; base64 also works.
 
 Firebase API keys identify the project; they are not passwords. The Firestore rules and the
@@ -68,19 +70,6 @@ Then add `ANDROID_KEYSTORE_PASSWORD` and `ANDROID_KEY_ALIAS` (`upload`). Keep th
 safe: every future update must be signed with it. If you don't set it up, builds are signed
 with a throwaway debug key.
 
-### iOS signing (TestFlight / App Store)
-
-1. Create an App Store Connect API key with the **App Manager** role (Users and Access →
-   Integrations).
-2. Add the secrets `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8` (the
-   `.p8` contents).
-3. Create the app in App Store Connect with your bundle ID. If it isn't
-   `com.lightwave.bondTouchBeyond`, set the repository variable `IOS_BUNDLE_ID`.
-
-Uploads to TestFlight happen only when you ask: Actions → Build → Run workflow → tick
-"Upload to TestFlight". Xcode signing sets up the certificate, the
-profile, and the HealthKit and Push capabilities automatically. Without these secrets, the
-iOS build is unsigned and only checks that the app compiles.
 
 ## Building
 
@@ -88,15 +77,13 @@ CI (`.github/workflows/build.yml`) runs on every push:
 
 1. Analyze and test.
 2. Android: APK + App Bundle.
-3. iOS: signed build, or unsigned without the Apple secrets.
 
-On `main` it also publishes a GitHub Release with the APK. It never uploads to TestFlight
-unless you run it by hand with that box ticked.
+On `main` it also publishes a GitHub Release with the APK.
 Public repositories get these runners free.
 
 Locally:
 
     flutter pub get
     flutter test
-    scripts/firebase_defines.py --android google-services.json --ios GoogleService-Info.plist > firebase.env.json
+    scripts/firebase_defines.py --android google-services.json > firebase.env.json
     flutter run --dart-define-from-file=firebase.env.json

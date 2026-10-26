@@ -18,7 +18,6 @@ PROJECT="" NEW=false SECRETS=true
 ANDROID_REPO="Coral-coder/Bond-touch-beyond-android"
 IOS_REPO="Coral-coder/bond-touch-beyond"
 ANDROID_PACKAGE="com.lightwave.beyond"
-FLUTTER_IOS_BUNDLE="com.lightwave.bondTouchBeyond"
 NATIVE_IOS_BUNDLE="com.lightwave.beyond"
 
 while [ $# -gt 0 ]; do
@@ -92,11 +91,9 @@ print(next((a['appId'] for a in apps if a.get('$field') == '$id'), ''))" || true
 step "Apps"
 mkdir -p firebase-config
 ANDROID_APP=$(app_id ANDROID packageName "$ANDROID_PACKAGE" "Bond Touch Beyond Android")
-FLUTTER_IOS_APP=$(app_id IOS bundleId "$FLUTTER_IOS_BUNDLE" "Bond Touch Beyond (Flutter iOS)")
 NATIVE_IOS_APP=$(app_id IOS bundleId "$NATIVE_IOS_BUNDLE" "Bond Touch Beyond iPhone")
 $FB apps:sdkconfig ANDROID "$ANDROID_APP" --project "$PROJECT" --out firebase-config/google-services.json
-$FB apps:sdkconfig IOS "$FLUTTER_IOS_APP" --project "$PROJECT" --out firebase-config/GoogleService-Info.plist
-$FB apps:sdkconfig IOS "$NATIVE_IOS_APP" --project "$PROJECT" --out firebase-config/GoogleService-Info-native.plist
+$FB apps:sdkconfig IOS "$NATIVE_IOS_APP" --project "$PROJECT" --out firebase-config/GoogleService-Info.plist
 echo "Config files are in firebase-config/ (git-ignored)."
 
 step "Anonymous sign-in"
@@ -120,8 +117,7 @@ if $SECRETS; then
   step "GitHub secrets"
   command -v gh > /dev/null || { echo "Install the GitHub CLI (https://cli.github.com), run 'gh auth login', then re-run."; exit 1; }
   gh secret set GOOGLE_SERVICES_JSON -R "$ANDROID_REPO" < firebase-config/google-services.json
-  gh secret set GOOGLE_SERVICE_INFO_PLIST -R "$ANDROID_REPO" < firebase-config/GoogleService-Info.plist
-  gh secret set GOOGLE_SERVICE_INFO_PLIST -R "$IOS_REPO" < firebase-config/GoogleService-Info-native.plist
+  gh secret set GOOGLE_SERVICE_INFO_PLIST -R "$IOS_REPO" < firebase-config/GoogleService-Info.plist
   echo "Set on $ANDROID_REPO and $IOS_REPO. The next build of each uses Firebase."
 fi
 
