@@ -1,17 +1,16 @@
-# Builds the Android app on every push and pull request. (The iPhone app is the native one
-# in its own repository; this Flutter project is built for Android only.) Everything it
-# needs comes from this repository's own secrets and variables (Settings → Secrets and
-# variables → Actions); nothing outside the repo. Every secret is optional: without them the
-# apps still build (debug-signed), so a fork builds out of the box.
+# Builds the Android app on every push and pull request; every push to main is also published
+# as a GitHub Release that installed copies pick up as an in-app update (lib/app/updater.dart).
+# (The iPhone app is the native one in its own repository.)
 #
-# Secrets
-#   ANDROID_KEYSTORE_BASE64     Android upload key (PKCS12 keystore), base64
-#   ANDROID_KEYSTORE_PASSWORD   its password
-#   ANDROID_KEY_ALIAS           its key alias (default "upload")
-#   ANDROID_KEY_PASSWORD        the key's password (default: the keystore password)
+# Each release carries BondTouchBeyond.apk, the .aab and update.json (version, version code =
+# this workflow's run number, APK link). Stable links to the newest build:
+#   https://github.com/<owner>/<repo>/releases/latest/download/BondTouchBeyond.apk
+#   https://github.com/<owner>/<repo>/releases/latest/download/update.json
 #
-# Outputs: the Android APK + AAB as run artifacts; on main, a GitHub
-# Release with the APK (…/releases/latest/download/BondTouchBeyond.apk).
+# Signing: the ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS /
+# ANDROID_KEY_PASSWORD secrets (the upload key shared with the other apps; Dev_deploy_setup's
+# "Set up app repo" copies them here). Without them builds use a throwaway debug key, and an
+# update then needs an uninstall first.
 name: Build
 
 on:
@@ -24,7 +23,8 @@ permissions:
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a run on main midway: it may be publishing a release.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   FLUTTER_VERSION: 3.47.7
@@ -59,21 +59,38 @@ jobs:
           cache: true
       - run: flutter pub get
 
+      # The upload key shared with the other apps (MagicTrek & co.): the ANDROID_KEYSTORE_*
+      # secrets, or the same without the ANDROID_ prefix. Every release must be signed with the
+      # same key, or the in-app updater can't install it over the previous build.
       - name: Signing key
         env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 || secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
-            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/upload-keystore.p12
-          else
-            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: signing with a debug key."
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "SIGNED=debug" >> "$GITHUB_ENV"
+            echo "::warning::No ANDROID_KEYSTORE_* secrets: signed with a throwaway debug key, so installed copies can't update to this build in place."
+            exit 0
           fi
+          store="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$store"
+          alias="$KEY_ALIAS"
+          if [ -z "$alias" ]; then
+            alias=$(keytool -list -keystore "$store" -storepass "$KEYSTORE_PASSWORD" 2>/dev/null | sed -nE 's/^([^,]+),.*PrivateKeyEntry.*/\1/p' | head -1)
+          fi
+          echo "::add-mask::$KEYSTORE_PASSWORD"
+          {
+            echo "ANDROID_KEYSTORE_PATH=$store"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=$alias"
+            echo "ANDROID_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            echo "SIGNED=release"
+          } >> "$GITHUB_ENV"
+          echo "Signing with the release key (alias $alias)"
 
       - name: Build APK and App Bundle
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           args="--release --build-number $GITHUB_RUN_NUMBER"
           flutter build apk $args
@@ -87,16 +104,37 @@ jobs:
           name: android-${{ github.run_number }}
           path: dist/
 
+      # Every release carries update.json (version, version code = this run's number, APK
+      # link); installed copies read the one behind releases/latest/download/update.json on
+      # launch and offer the new build (lib/app/updater.dart).
       - name: Release
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(sed -nE 's/^version: ([0-9.]+)\+.*/\1/p' pubspec.yaml)
-          gh release create "build-$GITHUB_RUN_NUMBER" dist/BondTouchBeyond.apk dist/BondTouchBeyond.aab \
-            --title "Bond Touch Beyond $VERSION ($GITHUB_RUN_NUMBER)" \
-            --notes "Build $GITHUB_RUN_NUMBER from ${GITHUB_SHA::7}. On Android, install BondTouchBeyond.apk." --latest
+          TAG="build-$GITHUB_RUN_NUMBER"
+          SUBJECT=$(git log -1 --format=%s)
+          python3 - "$VERSION" "$GITHUB_RUN_NUMBER" "$TAG" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/BondTouchBeyond.apk" "$SUBJECT" "$SIGNED" <<'PY'
+          import json, sys
+          name, code, tag, apk, notes, signed = sys.argv[1:7]
+          json.dump({"versionName": name, "versionCode": int(code), "tag": tag, "apk": apk,
+                     "notes": notes, "signing": signed}, open("dist/update.json", "w"), indent=2)
+          PY
+          {
+            echo "Bond Touch Beyond $VERSION (build $GITHUB_RUN_NUMBER) for Android, from \`${GITHUB_SHA::7}\`: $SUBJECT"
+            echo
+            echo "- **Install**: download \`BondTouchBeyond.apk\` on the phone and open it."
+            echo "- **Always the newest build**: https://github.com/$GITHUB_REPOSITORY/releases/latest/download/BondTouchBeyond.apk"
+            echo "- Installed copies offer this build as an update when opened."
+            if [ "$SIGNED" = debug ]; then
+              echo "- Signed with a throwaway debug key: uninstall the previous build first."
+            fi
+          } > dist/notes.md
+          gh release create "$TAG" dist/BondTouchBeyond.apk dist/BondTouchBeyond.aab dist/update.json \
+            --title "Bond Touch Beyond $VERSION (build $GITHUB_RUN_NUMBER)" --notes-file dist/notes.md --latest
 
       - name: Clean up
         if: always()
-        run: rm -f android/upload-keystore.p12
+        run: rm -f "$RUNNER_TEMP/release.keystore"

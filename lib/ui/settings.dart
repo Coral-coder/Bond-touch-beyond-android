@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
 import '../app/app_model.dart';
+import '../app/updater.dart';
 import 'onboarding.dart';
 import 'pairing.dart';
 import 'theme.dart';
+import 'update.dart';
 
 /// Profile, bracelet, sharing, partners and the Bond Touch account.
 class SettingsPage extends StatelessWidget {
@@ -166,6 +168,59 @@ class SettingsPage extends StatelessWidget {
               ),
             ],
           ),
+        ),
+        const SizedBox(height: 14),
+        ListenableBuilder(
+          listenable: Updater.shared,
+          builder: (context, _) {
+            final u = Updater.shared;
+            return Glass(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'App version',
+                          style: TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        Text(
+                          u.installedCode == 0
+                              ? '—'
+                              : '${u.installedVersion} (build ${u.installedCode})'
+                                    '${u.available != null ? ' · ${u.available!.label} available' : ''}',
+                          style: const TextStyle(color: AppTheme.subtitle),
+                        ),
+                      ],
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: u.checking
+                        ? null
+                        : () async {
+                            final r = await u.check();
+                            if (r != null && context.mounted) {
+                              await UpdateDialog.show(context, r);
+                            } else if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    u.error ?? 'You have the newest build.',
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                    child: const Text('Check for updates'),
+                  ),
+                ],
+              ),
+            );
+          },
         ),
       ],
     ),
