@@ -3,12 +3,12 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 
 import '../app/app_model.dart';
-import '../models/presence.dart';
+import 'onboarding.dart';
 import 'charts.dart';
 import 'theme.dart';
 
-/// A partner's page: their status (phone, bracelet, last check-in, location), how they're
-/// feeling, and their stress, HRV and heart rate — each the last report, with its time.
+/// A partner's page: online status, phone battery and location from the Bond Touch
+/// servers, and the colour their touches light up in.
 class PartnerDetail extends StatelessWidget {
   const PartnerDetail({super.key, required this.model, required this.partner});
   final AppModel model;
@@ -18,8 +18,6 @@ class PartnerDetail extends StatelessWidget {
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: model,
     builder: (context, _) {
-      final p = partner.presence;
-      final mood = p?.mood;
       return Scaffold(
         appBar: AppBar(title: Text(partner.name)),
         body: ListView(
@@ -49,95 +47,58 @@ class PartnerDetail extends StatelessWidget {
                     ),
                   ),
                   _row(
+                    Icons.circle,
+                    'App',
+                    partner.online
+                        ? 'Online now'
+                        : (partner.lastSeen == null
+                              ? 'Offline'
+                              : 'Seen ${agoText(partner.lastSeen!)}'),
+                  ),
+                  _row(
                     Icons.battery_std,
                     'Phone',
-                    p?.phoneBattery == null
-                        ? '—'
-                        : '${(p!.phoneBattery! * 100).round()}%${p.phoneCharging == true ? ' · charging' : ''}',
-                  ),
-                  _row(
-                    Icons.watch,
-                    'Bracelet',
-                    p == null
-                        ? '—'
-                        : p.bracelet == true
-                        ? 'Connected${p.braceletBattery != null ? ' · ${p.braceletBattery}%' : ''}'
-                        : p.braceletLastConnected != null
-                        ? 'Last connected ${agoText(p.braceletLastConnected!)}'
-                        : 'Not connected',
-                  ),
-                  _row(
-                    Icons.schedule,
-                    'Last check-in',
-                    p == null
-                        ? '—'
-                        : (partner.online ? 'Online now' : agoText(p.sentAt)),
+                    partner.phoneBattery == null
+                        ? 'No battery reported yet'
+                        : '${(partner.phoneBattery! * 100).round()}%',
                   ),
                   _row(
                     Icons.location_on,
-                    'Location update',
-                    p?.locationAt == null
-                        ? 'None yet'
-                        : agoText(p!.locationAt!),
+                    'Location',
+                    partner.lat == null ? 'Not shared' : 'Shared',
                   ),
-                  if (p?.lat != null && model.location.last != null)
+                  if (partner.lat != null && model.location.last != null)
                     _row(
                       Icons.straighten,
                       'Distance',
                       _distance(
                         model.location.last!.latitude,
                         model.location.last!.longitude,
-                        p!.lat!,
-                        p.lng!,
+                        partner.lat!,
+                        partner.lng!,
                       ),
                     ),
+                  if (partner.bond.email.isNotEmpty)
+                    _row(Icons.email, 'Account', partner.bond.email),
                 ],
               ),
             ),
             const SizedBox(height: 14),
             Glass(
-              child: Row(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    mood == null
-                        ? '🫥'
-                        : (mood.emoji.isEmpty
-                              ? MoodShare.face(mood.stress).emoji
-                              : mood.emoji),
-                    style: const TextStyle(fontSize: 40),
+                  const Text(
+                    'Their colour on your bracelet',
+                    style: TextStyle(fontWeight: FontWeight.w800),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          mood == null
-                              ? 'No mood reported yet'
-                              : (mood.label.isEmpty
-                                    ? MoodShare.face(mood.stress).label
-                                    : mood.label),
-                          style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        if (mood != null)
-                          Text(
-                            'Stress ${mood.stress} / 100 · ${whenText(context, mood.at)}',
-                            style: const TextStyle(color: AppTheme.subtitle),
-                          ),
-                      ],
-                    ),
+                  const SizedBox(height: 10),
+                  ColorRow(
+                    selected: partner.colorRGB,
+                    onPick: (c) => model.setPartnerColor(partner, c),
                   ),
                 ],
               ),
-            ),
-            const SizedBox(height: 14),
-            HealthCharts(
-              series: mood?.series ?? const [],
-              heartRate: mood?.heartRate ?? const [],
-              emptyText: 'No Health readings from ${partner.name} yet.',
             ),
             const SizedBox(height: 14),
             OutlinedButton.icon(
@@ -167,7 +128,7 @@ class PartnerDetail extends StatelessWidget {
                   ),
                 );
                 if (ok == true) {
-                  await model.removePartner(partner.bond);
+                  await model.removeBond(partner.bond);
                   if (context.mounted) Navigator.of(context).pop();
                 }
               },

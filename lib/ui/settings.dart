@@ -5,7 +5,7 @@ import 'onboarding.dart';
 import 'pairing.dart';
 import 'theme.dart';
 
-/// Profile, bracelet, sharing and partners.
+/// Profile, bracelet, sharing, partners and the Bond Touch account.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key, required this.model});
   final AppModel model;
@@ -89,14 +89,6 @@ class SettingsPage extends StatelessWidget {
                   'Your partners see where you are and how far apart you are.',
                 ),
               ),
-              SwitchListTile(
-                value: model.shareMood,
-                onChanged: model.setMoodSharing,
-                title: const Text('Share stress & mood'),
-                subtitle: const Text(
-                  'Battery, mood, HRV and heart rate from Health Connect.',
-                ),
-              ),
             ],
           ),
         ),
@@ -125,14 +117,15 @@ class SettingsPage extends StatelessWidget {
                       : null,
                   onTap: () => model.select(p.id),
                 ),
-              for (final b in model.pending)
+              for (final b in model.sentInvites)
                 ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: const Icon(Icons.hourglass_top),
-                  title: const Text('Invite waiting for your partner'),
+                  title: Text(b.email.isEmpty ? b.partnerName : b.email),
+                  subtitle: const Text('Waiting for them to accept'),
                   trailing: IconButton(
                     icon: const Icon(Icons.close),
-                    onPressed: () => model.removePartner(b),
+                    onPressed: () => model.removeBond(b),
                   ),
                 ),
               TextButton.icon(
@@ -141,6 +134,35 @@ class SettingsPage extends StatelessWidget {
                 onPressed: () => Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => PairingPage(model: model)),
                 ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        Glass(
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Bond Touch account',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    Text(
+                      model.email,
+                      style: const TextStyle(color: AppTheme.subtitle),
+                    ),
+                  ],
+                ),
+              ),
+              TextButton(
+                onPressed: model.signOut,
+                child: const Text('Sign out'),
               ),
             ],
           ),

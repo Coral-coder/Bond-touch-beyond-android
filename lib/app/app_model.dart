@@ -1,88 +1,87 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:battery_plus/battery_plus.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../core/firebase_config.dart';
+import '../backend/bond_backend.dart';
 import '../bracelet/bracelet_manager.dart';
-import '../core/bond_crypto.dart';
-import '../core/swift_json.dart';
 import '../models/bond.dart';
-import '../models/chat_message.dart';
-import '../models/presence.dart';
 import '../models/touch_message.dart';
-import '../relay/firebase_relay.dart';
 import '../services/health_service.dart';
 import '../services/location_service.dart';
 import '../services/notifier.dart';
 
-/// A partner: their bond plus what we know about them (profile, last status, photo).
+/// A partner on the original Bond Touch backend, with what it tells us about them.
 class Partner {
   Partner(this.bond);
   final Bond bond;
-  String get id => bond.code;
+  String get id => bond.id;
   String get name => bond.partnerName;
   int colorRGB = 0xFF4081;
   Uint8List? photo;
-  Presence? presence;
-  String? pushToken;
-  int seenTouch = 0, seenMessage = 0;
-  int? lastBPM;
-  DateTime? lastBPMAt;
+  String icon = '';
+  bool online = false;
+  DateTime? lastSeen;
+  double? lat, lng;
 
-  bool get online =>
-      presence?.online == true &&
-      DateTime.now().difference(presence!.sentAt) < const Duration(minutes: 15);
+  /// 0…1, as the partner's phone reports it.
+  double? phoneBattery;
+  List<Meaning> meanings = [];
 }
 
-/// The whole app's state and its link to partners, the bracelet, Health and location.
+/// The whole app's state: the account on the original Bond Touch backend, partners, the
+/// bracelet, Health and location. Mirrors the original app's sync, as the iPhone app does
+/// in its original-backend mode: it polls `GET bond/api/v4/bonds` (partners, invites,
+/// received touches, Touch Language), plays new touches and acknowledges them, and pushes
+/// this phone's changes with the matching calls. (The official app is woken by pushes sent to
+/// its own app id, which no other app receives, so this one polls while it runs.)
 class AppModel extends ChangeNotifier {
   AppModel();
 
-  final relay = FirebaseRelay();
   final bracelet = BraceletManager();
   final health = HealthService();
   final location = LocationService();
   final notifier = Notifier();
-  final _battery = Battery();
 
-  bool firebaseReady = false;
-  String? firebaseError;
-  String myID = '';
+  // Account
+  String email = '';
+  String _idToken = '', _refreshToken = '';
+  bool get signedIn => _refreshToken.isNotEmpty;
+  String? syncError;
+  DateTime? lastSync;
 
   // Profile
   String name = '';
   int colorRGB = 0xFF4081;
   Uint8List? myPhoto;
-  bool get profileComplete => name.isNotEmpty;
+  bool get profileComplete => signedIn && name.isNotEmpty;
 
-  // Settings
   bool sharingLocation = true;
-  bool shareMood = true;
 
   final partners = <Partner>[];
-  final pending = <Bond>[];
+  final sentInvites = <Bond>[];
+  final receivedInvites = <Bond>[];
   String? selectedID;
   Partner? get selected =>
       partners.where((p) => p.id == selectedID).firstOrNull ??
       partners.firstOrNull;
 
   final history = <TouchMessage>[];
-  final chats = <String, List<ChatMessage>>{};
   final _historyIDs = <String>{};
 
-  /// The mood you logged last (kept 12 hours in what partners see).
+  /// The mood you logged last (shown on Stress & mood).
   ({String emoji, String label, String level, int energy, DateTime at})?
   loggedMood;
 
   bool inForeground = true;
   Timer? _poll;
-  final _watches = <String, StreamSubscription<void>>{};
-  DateTime _lastPresence = DateTime.fromMillisecondsSinceEpoch(0);
+  int _cycle = 0;
+  bool _primed = false;
+  Set<String> _seenTouches = {};
+  DateTime _lastLocationPush = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _profileDebounce;
 
   // MARK: Start-up
 
@@ -91,85 +90,125 @@ class AppModel extends ChangeNotifier {
     await health.load();
     await location.load();
     await notifier.init();
-    location.onUpdate = (_) => publishPresence();
+    location.onUpdate = (_) => _pushLocation();
     bracelet.onTouchDrawn = (pattern, generation) =>
         sendTouch(pattern: pattern, generation: generation);
-    bracelet.addListener(_braceletChanged);
+    bracelet.addListener(notifyListeners);
     unawaited(bracelet.start());
-    try {
-      await Firebase.initializeApp(options: FirebaseConfig.options);
-      myID = await relay.signIn();
-      firebaseReady = true;
-    } catch (e) {
-      firebaseError = '$e';
-    }
+    unawaited(health.refresh().then((_) => notifyListeners()));
     notifyListeners();
-    if (!firebaseReady) return;
-    if (sharingLocation) unawaited(location.start());
-    unawaited(health.refresh().then((_) => publishPresence(force: true)));
-    await refreshAll();
-    _startPolling();
-    for (final p in partners) {
-      _watch(p.bond);
-    }
-  }
-
-  void _braceletChanged() {
-    notifyListeners();
-    publishPresence(force: true);
+    if (signedIn) _startSync();
   }
 
   Future<void> setForeground(bool fg) async {
     inForeground = fg;
     await location.setBackground(!fg);
-    _startPolling();
-    await publishPresence(force: true);
-    if (fg) await refreshAll();
+    if (signedIn) {
+      _startSync();
+      if (fg) await syncOnce();
+    }
   }
 
-  void _startPolling() {
+  // Every 4 s on screen, every 15 s in the background — as the iPhone app.
+  void _startSync() {
     _poll?.cancel();
-    // Partners' changes arrive live through the cursor listener (`_watch`); polling is only
-    // a fallback, kept slow for Firestore's free daily read allowance.
     _poll = Timer.periodic(
-      Duration(seconds: inForeground ? 30 : 60),
-      (_) => refreshAll(),
+      Duration(seconds: inForeground ? 4 : 15),
+      (_) => syncOnce(),
     );
+    if (_cycle == 0) {
+      unawaited(_setOnline(true));
+      unawaited(syncOnce());
+      if (sharingLocation) unawaited(location.start(background: !inForeground));
+    }
   }
 
-  void _watch(Bond bond) {
-    _watches[bond.code]?.cancel();
-    _watches[bond.code] = relay.watch(bond).listen((_) => refreshAll());
+  // MARK: Account
+
+  Future<void> sendSignInLink(String email) async {
+    await BondBackend.sendSignInLink(email.trim());
+    this.email = email.trim();
+    (await SharedPreferences.getInstance()).setString('bt.email', this.email);
+  }
+
+  Future<void> completeSignIn(String link) async {
+    final s = await BondBackend.signInWithLink(email, link);
+    await _saveSession(s);
+    // Your name and colour as the account has them.
+    try {
+      final profile = (await BondBackend.user(_idToken))['profile'] as Map?;
+      final n = profile?['name'] as String?;
+      if (n != null && n.isNotEmpty && name.isEmpty) name = n;
+      final c = BondBackend.rgb(profile?['color']);
+      if (c != null) colorRGB = c;
+      final p = await SharedPreferences.getInstance();
+      await p.setString('name', name);
+      await p.setInt('color', colorRGB);
+    } catch (_) {}
+    _primed = false;
+    _cycle = 0;
+    notifyListeners();
+    _startSync();
+  }
+
+  Future<void> signOut() async {
+    _poll?.cancel();
+    try {
+      await BondBackend.setOnline(false, await _token());
+    } catch (_) {}
+    _idToken = _refreshToken = '';
+    partners.clear();
+    sentInvites.clear();
+    receivedInvites.clear();
+    _seenTouches = {};
+    _primed = false;
+    _cycle = 0;
+    final p = await SharedPreferences.getInstance();
+    for (final k in ['bt.idToken', 'bt.refreshToken', 'bonds', 'seenTouches']) {
+      await p.remove(k);
+    }
+    notifyListeners();
+  }
+
+  Future<void> _saveSession(Session s) async {
+    _idToken = s.idToken;
+    _refreshToken = s.refreshToken;
+    final p = await SharedPreferences.getInstance();
+    await p.setString('bt.idToken', _idToken);
+    await p.setString('bt.refreshToken', _refreshToken);
+  }
+
+  /// A valid ID token, refreshed when it's about to expire.
+  Future<String> _token() async {
+    final exp = BondBackend.tokenExpiry(_idToken);
+    if (exp != null &&
+        exp.difference(DateTime.now()) > const Duration(minutes: 5)) {
+      return _idToken;
+    }
+    await _saveSession(await BondBackend.refresh(_refreshToken));
+    return _idToken;
   }
 
   // MARK: Local storage
 
   Future<void> _loadLocal() async {
     final p = await SharedPreferences.getInstance();
+    email = p.getString('bt.email') ?? '';
+    _idToken = p.getString('bt.idToken') ?? '';
+    _refreshToken = p.getString('bt.refreshToken') ?? '';
     name = p.getString('name') ?? '';
     colorRGB = p.getInt('color') ?? 0xFF4081;
     final photo = p.getString('photo');
     myPhoto = photo == null ? null : base64Decode(photo);
     sharingLocation = p.getBool('shareLocation') ?? true;
-    shareMood = p.getBool('shareMood') ?? true;
     selectedID = p.getString('selected');
+    _seenTouches = (p.getStringList('seenTouches') ?? const []).toSet();
+    _primed = _seenTouches.isNotEmpty;
     for (final raw in p.getStringList('bonds') ?? const []) {
       final b = Bond.fromJson((jsonDecode(raw) as Map).cast<String, Object?>());
-      if (b.pending) {
-        pending.add(b);
-      } else {
-        final partner = Partner(b);
-        final cached = p.getString('presence.${b.code}');
-        if (cached != null) {
-          partner.presence = Presence(
-            (jsonDecode(cached) as Map).cast<String, Object?>(),
-          );
-        }
-        partner.colorRGB = p.getInt('pcolor.${b.code}') ?? 0xFF4081;
-        final ph = p.getString('pphoto.${b.code}');
-        if (ph != null) partner.photo = base64Decode(ph);
-        partners.add(partner);
-      }
+      final partner = Partner(b)
+        ..colorRGB = p.getInt('pcolor.${b.id}') ?? 0xFF4081;
+      partners.add(partner);
     }
     for (final raw in p.getStringList('history') ?? const []) {
       final t = _touchFromStore(
@@ -177,14 +216,6 @@ class AppModel extends ChangeNotifier {
       );
       history.add(t);
       _historyIDs.add(t.id);
-    }
-    for (final b in [...partners.map((p) => p.bond), ...pending]) {
-      chats[b.code] = [
-        for (final raw in p.getStringList('chat.${b.code}') ?? const [])
-          ChatMessage.fromJson(
-            (jsonDecode(raw) as Map).cast<String, Object?>(),
-          ),
-      ];
     }
     final mood = p.getString('loggedMood');
     if (mood != null) {
@@ -202,9 +233,11 @@ class AppModel extends ChangeNotifier {
   Future<void> _saveBonds() async {
     final p = await SharedPreferences.getInstance();
     await p.setStringList('bonds', [
-      for (final b in [...partners.map((x) => x.bond), ...pending])
-        jsonEncode(b.toJson()),
+      for (final x in partners) jsonEncode(x.bond.toJson()),
     ]);
+    for (final x in partners) {
+      await p.setInt('pcolor.${x.id}', x.colorRGB);
+    }
   }
 
   Future<void> _saveHistory() async {
@@ -214,15 +247,6 @@ class AppModel extends ChangeNotifier {
         : history;
     await p.setStringList('history', [
       for (final t in keep) jsonEncode(_touchToStore(t)),
-    ]);
-  }
-
-  Future<void> _saveChat(String code) async {
-    final p = await SharedPreferences.getInstance();
-    final list = chats[code] ?? [];
-    final keep = list.length > 500 ? list.sublist(list.length - 500) : list;
-    await p.setStringList('chat.$code', [
-      for (final m in keep) jsonEncode(m.toJson()),
     ]);
   }
 
@@ -236,9 +260,6 @@ class AppModel extends ChangeNotifier {
     'e': t.endColorRGB,
     'at': t.sentAt.millisecondsSinceEpoch,
     'ml': t.meaningLabel,
-    'me': t.meaningEmoji,
-    'bpm': t.heartbeatBPM,
-    'fx': t.effect,
   };
 
   TouchMessage _touchFromStore(Map<String, Object?> j) => TouchMessage(
@@ -251,9 +272,6 @@ class AppModel extends ChangeNotifier {
     endColorRGB: (j['e'] as num).toInt(),
     sentAt: DateTime.fromMillisecondsSinceEpoch((j['at'] as num).toInt()),
     meaningLabel: j['ml'] as String?,
-    meaningEmoji: j['me'] as String?,
-    heartbeatBPM: (j['bpm'] as num?)?.toInt(),
-    effect: j['fx'] as String?,
   );
 
   // MARK: Profile & settings
@@ -271,20 +289,17 @@ class AppModel extends ChangeNotifier {
     await p.setInt('color', colorRGB);
     if (photo != null) await p.setString('photo', base64Encode(photo));
     notifyListeners();
-    for (final partner in partners) {
-      unawaited(_sendProfile(partner.bond));
-    }
-  }
-
-  Future<void> _sendProfile(Bond bond) async {
-    try {
-      await relay.sendProfile(
-        bond,
-        name: name.isEmpty ? 'Me' : name,
-        colorRGB: colorRGB,
-        photo: myPhoto,
-      );
-    } catch (_) {}
+    // The colour picker fires per change: send the last one.
+    _profileDebounce?.cancel();
+    _profileDebounce = Timer(const Duration(seconds: 1), () async {
+      try {
+        await BondBackend.updateProfile(
+          this.name,
+          this.colorRGB,
+          await _token(),
+        );
+      } catch (_) {}
+    });
   }
 
   Future<void> setLocationSharing(bool on) async {
@@ -294,14 +309,10 @@ class AppModel extends ChangeNotifier {
         ? await location.start(background: !inForeground)
         : await location.stop();
     notifyListeners();
-    await publishPresence(force: true);
-  }
-
-  Future<void> setMoodSharing(bool on) async {
-    shareMood = on;
-    (await SharedPreferences.getInstance()).setBool('shareMood', on);
-    notifyListeners();
-    await publishPresence(force: true);
+    try {
+      await BondBackend.updateSharing(on, await _token());
+    } catch (_) {}
+    if (on) await _pushLocation(force: true);
   }
 
   Future<void> logMood(
@@ -328,8 +339,10 @@ class AppModel extends ChangeNotifier {
       }),
     );
     notifyListeners();
-    await publishPresence(force: true);
   }
+
+  /// Health readings changed (after asking for access, or a refresh).
+  void healthChanged() => notifyListeners();
 
   void select(String id) {
     selectedID = id;
@@ -339,176 +352,225 @@ class AppModel extends ChangeNotifier {
 
   // MARK: Bonds
 
-  Future<String> createInvite() async {
-    final bond = await relay.createBond(
-      name: name.isEmpty ? 'Me' : name,
-      myID: myID,
-      colorRGB: colorRGB,
-    );
-    pending.add(bond);
-    chats[bond.code] = [];
+  /// Invites someone by the email of their Bond Touch account.
+  Future<void> invite(String email) async {
+    await BondBackend.invite(email.trim(), await _token());
+    await syncOnce();
+  }
+
+  Future<void> accept(Bond bond) async {
+    await BondBackend.accept(bond.id, await _token());
+    selectedID = bond.id;
+    await syncOnce();
+  }
+
+  /// Unbonds, cancels a sent invite or declines a received one.
+  Future<void> removeBond(Bond bond) async {
+    await BondBackend.cancel(bond.id, await _token());
+    partners.removeWhere((p) => p.id == bond.id);
+    sentInvites.removeWhere((b) => b.id == bond.id);
+    receivedInvites.removeWhere((b) => b.id == bond.id);
+    if (selectedID == bond.id) selectedID = partners.firstOrNull?.id;
     await _saveBonds();
     notifyListeners();
-    return Bond.inviteLink(bond.code);
   }
 
-  Future<void> join(String codeOrLink) async {
-    final code = Bond.codeFromLink(codeOrLink) ?? Bond.normalize(codeOrLink);
-    if (partners.any((p) => p.id == code) ||
-        pending.any((b) => b.code == code)) {
-      return;
-    }
-    final bond = await relay.joinBond(
-      code,
-      name: name.isEmpty ? 'Me' : name,
-      colorRGB: colorRGB,
-    );
-    _addPartner(bond);
-    await _sendProfile(bond);
-    await refreshAll();
-  }
-
-  void _addPartner(Bond bond) {
-    final partner = Partner(bond);
-    partners.add(partner);
-    chats.putIfAbsent(bond.code, () => []);
-    selectedID ??= bond.code;
-    _saveBonds();
-    _watch(bond);
+  Future<void> setPartnerColor(Partner partner, int rgb) async {
+    partner.colorRGB = rgb;
     notifyListeners();
-  }
-
-  Future<void> removePartner(Bond bond) async {
-    await relay.deleteBond(bond);
-    partners.removeWhere((p) => p.id == bond.code);
-    pending.removeWhere((b) => b.code == bond.code);
-    await _watches.remove(bond.code)?.cancel();
-    if (selectedID == bond.code) selectedID = partners.firstOrNull?.id;
     await _saveBonds();
-    notifyListeners();
+    try {
+      await BondBackend.setPartnerColor(
+        partner.id,
+        rgb,
+        partner.icon,
+        await _token(),
+      );
+    } catch (_) {}
   }
 
   // MARK: Sync
 
-  bool _refreshing = false;
+  bool _syncing = false;
 
-  Future<void> refreshAll() async {
-    if (!firebaseReady || _refreshing) return;
-    _refreshing = true;
+  Future<void> syncOnce() async {
+    if (!signedIn || _syncing) return;
+    _syncing = true;
     try {
-      // An invite we made: once their profile appears, they've joined.
-      for (final b in [...pending]) {
-        final joined = await relay.joinedPartnerName(b);
-        if (joined != null) {
-          pending.remove(b);
-          b.pending = false;
-          b.partnerName = joined;
-          _addPartner(b);
-          await _sendProfile(b);
-        }
-      }
-      for (final partner in [...partners]) {
-        try {
-          await _sync(partner);
-        } catch (_) {}
-      }
-      await publishPresence();
+      final token = await _token();
+      await _apply(await BondBackend.bonds(token), token);
+      _cycle++;
+      // Partner details and presence change slowly: every few cycles.
+      if (_cycle % 4 == 1) await _refreshDetails(token);
+      if (_cycle % 8 == 1) await _setOnline(true);
+      lastSync = DateTime.now();
+      syncError = null;
+    } catch (e) {
+      syncError = '$e';
     } finally {
-      _refreshing = false;
+      _syncing = false;
+      notifyListeners();
     }
   }
 
-  Future<void> _sync(Partner partner) async {
-    final ev = await relay.fetchNewEvents(partner.bond);
-    final prefs = await SharedPreferences.getInstance();
-    var changed = false;
-    if (ev.partnerName != null && ev.partnerName != partner.bond.partnerName) {
-      partner.bond.partnerName = ev.partnerName!;
-      await _saveBonds();
-      changed = true;
-    }
-    if (ev.partnerColorRGB != null) {
-      partner.colorRGB = ev.partnerColorRGB!;
-      await prefs.setInt('pcolor.${partner.id}', partner.colorRGB);
-      changed = true;
-    }
-    if (ev.partnerPhoto != null) {
-      partner.photo = Uint8List.fromList(ev.partnerPhoto!);
-      await prefs.setString(
-        'pphoto.${partner.id}',
-        base64Encode(partner.photo!),
+  Future<void> _apply(List<Map<String, dynamic>> bonds, String token) async {
+    final next = <Partner>[];
+    sentInvites.clear();
+    receivedInvites.clear();
+    final toAck = <(String, String)>[];
+    final fresh = <TouchMessage>[];
+
+    for (final b in bonds) {
+      final id = b['bondId'] as String?;
+      if (id == null) continue;
+      final profile = (b['profile'] as Map?) ?? const {};
+      final settings = (b['settings'] as Map?) ?? const {};
+      final email = b['email'] as String? ?? '';
+      final n = profile['name'] as String?;
+      final bond = Bond(
+        id: id,
+        partnerName: (n == null || n.isEmpty)
+            ? (email.isEmpty ? 'Partner' : email)
+            : n,
+        email: email,
+        status: b['status'] as String? ?? '',
+        firebaseId: b['firebaseId'] as String? ?? '',
       );
-      changed = true;
-    }
-    if (ev.partnerPushToken != null) partner.pushToken = ev.partnerPushToken;
-    if (ev.partnerSeenTouch != null) partner.seenTouch = ev.partnerSeenTouch!;
-    if (ev.partnerSeenMessage != null) {
-      partner.seenMessage = ev.partnerSeenMessage!;
-    }
-    if (ev.presence != null) {
-      partner.presence = ev.presence!.mergedOver(partner.presence);
-      await prefs.setString(
-        'presence.${partner.id}',
-        jsonEncode(partner.presence!.json),
-      );
-      changed = true;
-    }
-    if (ev.latestBPM != null) {
-      partner.lastBPM = ev.latestBPM;
-      partner.lastBPMAt = ev.latestBPMAt;
-    }
-    for (final raw in ev.touches) {
-      final t = TouchMessage(
-        id: raw['id'] as String,
-        bondID: partner.id,
-        senderID: '${partner.id}-${partner.bond.theirRole}',
-        pattern: (raw['pattern'] as List)
-            .cast<num>()
-            .map((n) => n.toInt())
-            .toList(),
-        generation: (raw['generation'] as num?)?.toInt() ?? 2,
-        colorRGB: (raw['colorRGB'] as num?)?.toInt() ?? partner.colorRGB,
-        endColorRGB: (raw['endColorRGB'] as num?)?.toInt() ?? partner.colorRGB,
-        sentAt: SwiftJson.parseDate(raw['sentAt']),
-        meaningLabel: raw['meaningLabel'] as String?,
-        meaningEmoji: raw['meaningEmoji'] as String?,
-        heartbeatBPM: (raw['heartbeatBPM'] as num?)?.toInt(),
-        effect: raw['effect'] as String?,
-      );
-      if (_historyIDs.add(t.id)) {
-        history.add(t);
-        await _deliver(t, partner);
-        changed = true;
+      if (bond.sent) {
+        sentInvites.add(bond);
+        continue;
+      }
+      if (bond.received) {
+        receivedInvites.add(bond);
+        continue;
+      }
+      if (!bond.bonded) continue;
+
+      // Keep what the slower refreshes learned.
+      final known = partners.where((p) => p.id == id).firstOrNull;
+      final partner = Partner(bond)
+        ..colorRGB =
+            BondBackend.rgb(settings['color']) ??
+            BondBackend.rgb(profile['color']) ??
+            0xFF4081
+        ..icon = settings['icon'] as String? ?? ''
+        ..online = known?.online ?? false
+        ..lastSeen = known?.lastSeen
+        ..lat = known?.lat
+        ..lng = known?.lng
+        ..phoneBattery = known?.phoneBattery
+        ..meanings = [
+          for (final m in (b['meanings'] as List? ?? const []))
+            Meaning((m as Map).cast<String, dynamic>()),
+        ];
+      next.add(partner);
+
+      // Received touches: into the history and onto the bracelet, then acknowledged so the
+      // sender sees them delivered. The first sync after signing in only records what's
+      // already there.
+      for (final t in (b['touches'] as List? ?? const [])) {
+        final touch = (t as Map).cast<String, dynamic>();
+        final touchId = touch['id'] as String?;
+        if (touchId == null || _seenTouches.contains(touchId)) continue;
+        _seenTouches.add(touchId);
+        final msg = (touch['message'] as Map?) ?? const {};
+        final ms =
+            (msg['timestamp'] as num?)?.toInt() ??
+            DateTime.now().millisecondsSinceEpoch;
+        final ref = BondBackend.meaningRef(touch['meaning']);
+        final meaning = ref == null
+            ? null
+            : partner.meanings.where((m) => m.id == ref).firstOrNull;
+        final tm = TouchMessage(
+          id: touchId,
+          bondID: id,
+          senderID: bond.firebaseId.isEmpty ? id : bond.firebaseId,
+          pattern: BondBackend.pattern(msg['pattern']),
+          generation: BondBackend.generation(msg['generation']),
+          colorRGB: meaning?.colorRGB ?? partner.colorRGB,
+          endColorRGB: meaning?.endColorRGB ?? partner.colorRGB,
+          sentAt: DateTime.fromMillisecondsSinceEpoch(ms),
+          meaningLabel: meaning?.name,
+        );
+        fresh.add(tm);
+        if (_primed) await _deliver(tm, partner);
+        toAck.add((id, touchId));
       }
     }
-    if (ev.touches.isNotEmpty) await _saveHistory();
-    if (ev.messages.isNotEmpty) {
-      final list = chats.putIfAbsent(partner.id, () => []);
-      for (final m in ev.messages) {
-        final msg = ChatMessage(
-          id: m['id'] as String,
-          bondID: partner.id,
-          senderID: partner.id,
-          kind: m['kind'] as String? ?? 'text',
-          text: m['text'] as String? ?? '',
-          colorRGB: (m['colorRGB'] as num?)?.toInt() ?? partner.colorRGB,
-          sentAt: SwiftJson.parseDate(m['sentAt']),
-        );
-        if (list.any((x) => x.id == msg.id)) continue;
-        list.add(msg);
-        if (!inForeground) {
-          await notifier.show(
-            msg.id.hashCode,
-            partner.name,
-            msg.kind == 'image' ? '📷 Photo' : msg.text,
-            channel: 'messages',
-          );
+
+    partners
+      ..clear()
+      ..addAll(next);
+    for (final t in fresh) {
+      if (_historyIDs.add(t.id)) history.add(t);
+    }
+    history.sort((a, b) => a.sentAt.compareTo(b.sentAt));
+    _primed = true;
+    if (selectedID == null || !partners.any((p) => p.id == selectedID)) {
+      selectedID = partners.firstOrNull?.id;
+    }
+    final p = await SharedPreferences.getInstance();
+    final seen = _seenTouches.toList();
+    await p.setStringList(
+      'seenTouches',
+      seen.length > 2000 ? seen.sublist(seen.length - 2000) : seen,
+    );
+    await _saveBonds();
+    if (fresh.isNotEmpty) await _saveHistory();
+    for (final (bondId, touchId) in toAck) {
+      try {
+        await BondBackend.ackTouch(bondId, touchId, token);
+      } catch (_) {}
+    }
+  }
+
+  /// Partner location, sharing and phone battery.
+  Future<void> _refreshDetails(String token) async {
+    try {
+      for (final d in await BondBackend.details(token)) {
+        final partner = partners.where((p) => p.id == d['bondId']).firstOrNull;
+        if (partner == null) continue;
+        final loc = d['location'] as Map?;
+        if (d['sharing'] == true && loc?['lat'] is num && loc?['lng'] is num) {
+          partner.lat = (loc!['lat'] as num).toDouble();
+          partner.lng = (loc['lng'] as num).toDouble();
+        } else {
+          partner.lat = partner.lng = null;
+        }
+        final raw = (d['battery'] as num?)?.toDouble();
+        if (raw != null && raw >= 0) {
+          partner.phoneBattery = raw > 1 ? (raw / 100).clamp(0, 1) : raw;
         }
       }
-      await _saveChat(partner.id);
-      changed = true;
-    }
-    if (changed) notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> _setOnline(bool online) async {
+    try {
+      final status = await BondBackend.setOnline(online, await _token());
+      for (final p in partners) {
+        final on = status[p.id];
+        if (on == null) continue;
+        if (p.online && !on) p.lastSeen = DateTime.now();
+        p.online = on;
+      }
+    } catch (_) {}
+  }
+
+  /// This phone's location, at most every 30 s on screen and 2 min in the background.
+  Future<void> _pushLocation({bool force = false}) async {
+    final fix = location.last;
+    if (!signedIn || !sharingLocation || fix == null) return;
+    final gap = Duration(seconds: inForeground ? 30 : 120);
+    if (!force && DateTime.now().difference(_lastLocationPush) < gap) return;
+    _lastLocationPush = DateTime.now();
+    try {
+      await BondBackend.updateLocation(
+        fix.latitude,
+        fix.longitude,
+        await _token(),
+      );
+    } catch (_) {}
   }
 
   /// A partner's touch: on the bracelet if connected, else the phone's vibration; a
@@ -523,11 +585,7 @@ class AppModel extends ChangeNotifier {
       await notifier.show(
         t.id.hashCode,
         partner.name,
-        t.isHeartbeat
-            ? '💓 Heartbeat · ${t.heartbeatBPM} BPM'
-            : (t.meaningLabel != null
-                  ? '${t.meaningEmoji ?? ''} ${t.meaningLabel}'
-                  : 'Sent you a touch'),
+        t.meaningLabel ?? 'Sent you a touch',
       );
     }
   }
@@ -537,11 +595,6 @@ class AppModel extends ChangeNotifier {
   Future<void> sendTouch({
     required List<int> pattern,
     required int generation,
-    int? color,
-    int? endColor,
-    String? meaningLabel,
-    String? meaningEmoji,
-    int? heartbeatBPM,
     String? toBond,
   }) async {
     final partner = toBond == null
@@ -553,108 +606,46 @@ class AppModel extends ChangeNotifier {
       senderID: 'me',
       pattern: pattern,
       generation: generation,
-      colorRGB: color ?? colorRGB,
-      endColorRGB: endColor ?? color ?? colorRGB,
-      meaningLabel: meaningLabel,
-      meaningEmoji: meaningEmoji,
-      heartbeatBPM: heartbeatBPM,
+      colorRGB: colorRGB,
+      endColorRGB: colorRGB,
     );
     history.add(t);
     _historyIDs.add(t.id);
     notifyListeners();
+    final ref = await BondBackend.sendTouch(
+      partner.id,
+      pattern,
+      generation,
+      await _token(),
+    );
+    // The server matched it to a saved meaning: show it as that.
+    final meaning = ref == null
+        ? null
+        : partner.meanings.where((m) => m.id == ref).firstOrNull;
+    if (meaning != null) {
+      t.meaningLabel = meaning.name;
+      notifyListeners();
+    }
     await _saveHistory();
-    await relay.sendTouch(
-      partner.bond,
-      SwiftJson.compact({
-        'id': t.id,
-        'sentAt': SwiftJson.date(t.sentAt),
-        'pattern': t.pattern,
-        'generation': t.generation,
-        'colorRGB': t.colorRGB,
-        'endColorRGB': t.endColorRGB,
-        'meaningLabel': t.meaningLabel,
-        'meaningEmoji': t.meaningEmoji,
-        'heartbeatBPM': t.heartbeatBPM,
-        'effect': t.effect,
-      }),
-    );
   }
 
-  Future<void> sendChat(String text) async {
+  /// Sends one of the partner's saved touches (Touch Language) by its id.
+  Future<void> sendMeaning(Meaning m) async {
     final partner = selected;
-    if (partner == null || text.trim().isEmpty) return;
-    final msg = ChatMessage(
+    if (partner == null) return;
+    final t = TouchMessage(
       bondID: partner.id,
-      senderID: ChatMessage.me,
-      text: text.trim(),
-      colorRGB: colorRGB,
+      senderID: 'me',
+      pattern: m.pattern,
+      generation: m.generation,
+      colorRGB: m.colorRGB,
+      endColorRGB: m.endColorRGB,
+      meaningLabel: m.name,
     );
-    chats.putIfAbsent(partner.id, () => []).add(msg);
+    history.add(t);
+    _historyIDs.add(t.id);
     notifyListeners();
-    msg.ringSeq = await relay.sendChat(partner.bond, {
-      'id': msg.id,
-      'sentAt': SwiftJson.date(msg.sentAt),
-      'kind': 'text',
-      'text': msg.text,
-      'colorRGB': msg.colorRGB,
-    });
-    await _saveChat(partner.id);
-  }
-
-  // MARK: Presence
-
-  /// This phone's status for partners — the iPhone app's PresenceInfo. Throttled: every 15 s
-  /// moving / 2 min still on screen, 30 s / 3 min in the background, unless forced.
-  Future<void> publishPresence({bool force = false}) async {
-    if (!firebaseReady || partners.isEmpty) return;
-    final moving = (location.speed ?? 0) > 0.5;
-    final interval = inForeground ? (moving ? 15 : 120) : (moving ? 30 : 180);
-    if (!force &&
-        DateTime.now().difference(_lastPresence).inSeconds < interval) {
-      return;
-    }
-    _lastPresence = DateTime.now();
-    await health.refresh();
-    final info = <String, Object?>{'online': true};
-    final fix = location.last;
-    if (sharingLocation && fix != null) {
-      info['lat'] = fix.latitude;
-      info['lng'] = fix.longitude;
-      info['locationAt'] = SwiftJson.date(fix.timestamp);
-      info['speed'] = DateTime.now().difference(fix.timestamp).inSeconds < 60
-          ? (location.speed ?? 0)
-          : 0;
-    } else if (!sharingLocation) {
-      info['locationOff'] = true;
-    }
-    try {
-      info['phoneBattery'] = (await _battery.batteryLevel) / 100;
-      final state = await _battery.batteryState;
-      info['phoneCharging'] =
-          state == BatteryState.charging || state == BatteryState.full;
-    } catch (_) {}
-    info['bracelet'] = bracelet.isReady;
-    if (bracelet.batteryPercent != null) {
-      info['braceletBattery'] = bracelet.batteryPercent;
-    }
-    final last = bracelet.isReady ? DateTime.now() : bracelet.lastConnectedAt;
-    if (last != null) info['braceletLastConnected'] = SwiftJson.date(last);
-    if (shareMood) {
-      final mood = health.moodShare(logged: loggedMood);
-      if (mood != null) info['mood'] = mood;
-    } else {
-      info['moodOff'] = true;
-    }
-    for (final p in partners) {
-      try {
-        await relay.sendPresence(p.bond, info);
-      } catch (_) {}
-    }
-  }
-
-  Future<void> prepareCrypto() async {
-    for (final b in [...partners.map((p) => p.bond), ...pending]) {
-      await BondCrypto.prepare(b.code);
-    }
+    await BondBackend.sendMeaning(partner.id, m.id, await _token());
+    await _saveHistory();
   }
 }

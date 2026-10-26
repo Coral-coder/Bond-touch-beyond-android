@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../app/app_model.dart';
-import '../models/presence.dart';
 import '../models/touch_message.dart';
 import 'charts.dart';
-import 'chat.dart';
 import 'pairing.dart';
 import 'partner_detail.dart';
 import 'settings.dart';
@@ -12,7 +10,7 @@ import 'stress_mood.dart';
 import 'theme.dart';
 import 'touch_pad.dart';
 
-/// Home, Chat, Stress & mood and Settings.
+/// Home, Stress & mood and Settings.
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key, required this.model});
   final AppModel model;
@@ -28,7 +26,6 @@ class _HomeShellState extends State<HomeShell> {
     final m = widget.model;
     final pages = [
       HomePage(model: m),
-      ChatPage(model: m),
       StressMoodPage(model: m),
       SettingsPage(model: m),
     ];
@@ -48,10 +45,6 @@ class _HomeShellState extends State<HomeShell> {
         onDestinationSelected: (i) => setState(() => _tab = i),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.home_rounded), label: 'Home'),
-          NavigationDestination(
-            icon: Icon(Icons.chat_bubble_rounded),
-            label: 'Chat',
-          ),
           NavigationDestination(
             icon: Icon(Icons.favorite_rounded),
             label: 'Stress & mood',
@@ -75,11 +68,6 @@ class HomePage extends StatelessWidget {
     listenable: model,
     builder: (context, _) {
       final partner = model.selected;
-      if (model.firebaseError != null) {
-        return _Banner(
-          'Partners need Firebase, which isn\'t set up in this build yet.\n${model.firebaseError}',
-        );
-      }
       if (partner == null) return NoPartner(model: model);
       final history = model.history
           .where((t) => t.bondID == partner.id)
@@ -90,6 +78,25 @@ class HomePage extends StatelessWidget {
       return ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          if (model.syncError != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _Banner(
+                'Can\'t reach Bond Touch right now.\n${model.syncError}',
+              ),
+            ),
+          if (model.receivedInvites.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: GestureDetector(
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => PairingPage(model: model)),
+                ),
+                child: _Banner(
+                  '${model.receivedInvites.first.partnerName} invited you. Tap to answer.',
+                ),
+              ),
+            ),
           if (model.partners.length > 1)
             SizedBox(
               height: 64,
@@ -163,13 +170,6 @@ class HomePage extends StatelessWidget {
                       ],
                     ),
                   ),
-                  if (partner.presence?.mood case final MoodShare mood)
-                    Text(
-                      mood.emoji.isEmpty
-                          ? MoodShare.face(mood.stress).emoji
-                          : mood.emoji,
-                      style: const TextStyle(fontSize: 30),
-                    ),
                 ],
               ),
             ),
@@ -192,6 +192,24 @@ class HomePage extends StatelessWidget {
                   onSend: (samples) =>
                       model.sendTouch(pattern: samples, generation: 3),
                 ),
+                if (partner.meanings.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final mn in partner.meanings)
+                        ActionChip(
+                          avatar: CircleAvatar(
+                            backgroundColor: AppTheme.rgb(mn.colorRGB),
+                            radius: 8,
+                          ),
+                          label: Text(mn.name),
+                          onPressed: () => model.sendMeaning(mn),
+                        ),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),
@@ -223,11 +241,8 @@ class HomePage extends StatelessWidget {
   );
 
   String _statusLine(Partner p) {
-    final pr = p.presence;
-    if (pr == null) return 'Waiting for their first update';
-    final parts = <String>[p.online ? 'Online' : 'Seen ${agoText(pr.sentAt)}'];
-    if (pr.bracelet == true) parts.add('bracelet on');
-    return parts.join(' · ');
+    if (p.online) return 'Online';
+    return p.lastSeen == null ? 'Offline' : 'Seen ${agoText(p.lastSeen!)}';
   }
 }
 
@@ -300,23 +315,31 @@ class NoPartner extends StatelessWidget {
       ),
       const SizedBox(height: 8),
       const Text(
-        'Send them an invite link, or enter the code they sent you. Works with partners on iPhone too.',
+        'Invite them by the email of their Bond Touch account, or accept their invite. Works with partners on any Bond Touch app.',
         textAlign: TextAlign.center,
         style: TextStyle(color: AppTheme.subtitle),
       ),
       const SizedBox(height: 24),
       FilledButton.icon(
         icon: const Icon(Icons.person_add),
-        label: const Text('Invite or join'),
+        label: const Text('Invite or accept'),
         onPressed: () => Navigator.of(
           context,
         ).push(MaterialPageRoute(builder: (_) => PairingPage(model: model))),
       ),
-      if (model.pending.isNotEmpty)
+      if (model.receivedInvites.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(top: 16),
+          child: Text(
+            '${model.receivedInvites.first.partnerName} invited you. Tap above to accept.',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      if (model.sentInvites.isNotEmpty)
         const Padding(
           padding: EdgeInsets.only(top: 16),
           child: Text(
-            'Invite sent — waiting for your partner to join.',
+            'Invite sent. Waiting for your partner to accept.',
             textAlign: TextAlign.center,
           ),
         ),
